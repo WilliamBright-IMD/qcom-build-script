@@ -20,6 +20,7 @@ set -e
 KERNEL_DIR=${1:-imdt-qcom-oss-linux-dev}
 INSTALL_MOD_PATH="$KERNEL_DIR/modules_out"
 EFI_PART=/media/EFI
+APPLY_DISPLAY_OVERLAY=true
 
 if [ ! -d "$KERNEL_DIR" ]; then
 	echo "=== Cloning kernel repo ==="
@@ -49,7 +50,7 @@ make -j$(nproc) Image dtbs modules
 echo "=== Installing modules locally ==="
 rm -rf "$INSTALL_MOD_PATH"
 make INSTALL_MOD_PATH="$INSTALL_MOD_PATH" modules_install
-
+adb wait-for-device
 # Mount the EFI partition
 echo "=== Mounting EFI partition ==="
 adb shell "mkdir -p ${EFI_PART}"
