@@ -19,12 +19,12 @@ set -e
 
 KERNEL_DIR=${1:-imdt-qcom-oss-linux-dev}
 INSTALL_MOD_PATH="$KERNEL_DIR/modules_out"
-EFI_PART=/media/EFI
+EFI_PART=/boot/
 APPLY_DISPLAY_OVERLAY=true
 
 if [ ! -d "$KERNEL_DIR" ]; then
-	echo "=== Cloning kernel repo ==="
-	git clone git@github.com:imd-tec/imdt-qcom-oss-linux-dev.git "$KERNEL_DIR"
+  echo "=== Cloning kernel repo ==="
+  git clone git@github.com:imd-tec/imdt-qcom-oss-linux-dev.git "$KERNEL_DIR"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -37,10 +37,10 @@ export CROSS_COMPILE=aarch64-linux-gnu-
 echo "=== Configuring kernel ==="
 
 scripts/kconfig/merge_config.sh \
-		arch/arm64/configs/defconfig \
-		arch/arm64/configs/prune.config \
-		arch/arm64/configs/qcom.config \
-		"$SCRIPT_DIR/bsp-additions.config"
+  arch/arm64/configs/defconfig \
+  arch/arm64/configs/prune.config \
+  arch/arm64/configs/qcom.config \
+  "$SCRIPT_DIR/bsp-additions.config"
 
 # Build kernel, DTBs and modules
 echo "=== Building kernel, DTBs and modules ==="
@@ -53,16 +53,19 @@ make INSTALL_MOD_PATH="$INSTALL_MOD_PATH" modules_install
 adb wait-for-device
 # Mount the EFI partition
 echo "=== Mounting EFI partition ==="
-adb shell "mkdir -p ${EFI_PART}"
-adb shell "mount /dev/sda2 ${EFI_PART}"
 
 # Push via ADB
 echo "=== Pushing kernel Image ==="
-adb push arch/arm64/boot/Image ${EFI_PART}
+adb push arch/arm64/boot/Image ${EFI_PART}/
 
 echo "=== Pushing DTB ==="
 adb shell "mkdir -p ${EFI_PART}/dtb/qcom/"
-adb push arch/arm64/boot/dts/qcom/qcs8550-imdt-*.dtb* ${EFI_PART}/dtb/qcom/
+adb pull ${EFI_PART}/dtb/qcom/ /tmp/
+adb push arch/arm64/boot/dts/qcom/qcs8550-imdt-*.dtb* ${EFI_PART}/
+if [ -n "$2" ]; then
+  echo "Overriding DTB with ${2}"
+  adb push arch/arm64/boot/dts/qcom/${2} /boot/qcs8550-imdt-sbc.dtb
+fi
 
 echo "=== Pushing kernel modules ==="
 adb push "$INSTALL_MOD_PATH"/lib/modules/* /lib/modules/
@@ -70,10 +73,8 @@ adb push "$INSTALL_MOD_PATH"/lib/modules/* /lib/modules/
 # Clean up local modules
 rm -rf "$INSTALL_MOD_PATH"
 
-
 adb shell sync
 adb shell umount ${EFI_PART}
 adb shell sync
-
 
 echo "=== Done ==="
