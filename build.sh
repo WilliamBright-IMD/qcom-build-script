@@ -2,15 +2,25 @@
 #
 # build.sh - Build and deploy kernel for Qualcomm QCS8550 IMDT SBC
 #
-# Usage: ./build.sh [--via-pi | --via-ssh] [--dtb-only] [KERNEL_DIR] [DTB_OVERRIDE]
+# Usage: ./build.sh [--via-pi | --via-ssh[=HOST]] [--dtb-only] [--skip-preflight]
+#                   [KERNEL_DIR] [DTB_OVERRIDE]
 #
 #   --via-pi      Deploy through a Raspberry Pi that is connected to the target
 #                 over ADB, instead of flashing directly from this host.
 #                 Artifacts are copied to pi@192.168.1.207:~/qcom-kernel and the
 #                 ADB flashing steps are run remotely on the Pi.
-#   --via-ssh     Deploy straight to the board over SSH (root@192.168.1.207:2222)
-#                 instead of using ADB. The board runs a full Linux userspace
-#                 with sshd, so artifacts are copied directly into place via scp.
+#   --via-ssh[=HOST]
+#                 Deploy straight to the board over SSH instead of using ADB.
+#                 The board runs a full Linux userspace with sshd, so artifacts
+#                 are copied directly into place via scp.
+#                 With no HOST, connects to root@192.168.1.206:2222. HOST may
+#                 be any ssh destination, including a Host alias from your
+#                 ~/.ssh/config (e.g. --via-ssh=home_qcom); in that case no
+#                 port is passed on the command line, so the alias's own
+#                 settings (Port, User, ...) apply.
+#   --skip-preflight
+#                 Skip the deploy-target reachability check, which normally
+#                 aborts before the build if the board cannot be reached.
 #   --dtb-only    Only build and deploy the DTBs/DTBOs. Skips the kernel Image
 #                 and modules entirely (no Image build, no modules build/install,
 #                 no module transfer) for fast device-tree iteration.
@@ -32,7 +42,9 @@ set -e
 # Parse arguments
 VIA_PI=false
 VIA_SSH=false
+SSH_TARGET=
 DTB_ONLY=false
+SKIP_PREFLIGHT=false
 POSITIONAL=()
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -44,8 +56,17 @@ while [ $# -gt 0 ]; do
 		VIA_SSH=true
 		shift
 		;;
+	--via-ssh=*)
+		VIA_SSH=true
+		SSH_TARGET="${1#--via-ssh=}"
+		shift
+		;;
 	--dtb-only)
 		DTB_ONLY=true
+		shift
+		;;
+	--skip-preflight)
+		SKIP_PREFLIGHT=true
 		shift
 		;;
 	*)
@@ -68,12 +89,56 @@ EFI_PART=/boot/
 APPLY_DISPLAY_OVERLAY=true
 
 # Raspberry Pi that is wired up to the target over ADB (used with --via-pi).
-PI_HOST=pi@192.168.1.207
+PI_HOST=pi@192.168.51.3
 PI_DIR=qcom-kernel # relative to the Pi user's home directory
 
 # Target board, reachable over SSH on the network (used with --via-ssh).
-BOARD_HOST=root@192.168.1.207
+# --via-ssh=HOST overrides this with an arbitrary ssh destination (e.g. an
+# alias from ~/.ssh/config) and clears the port so ssh/scp use the alias's
+# own configuration.
+BOARD_HOST=root@192.168.1.206
 BOARD_PORT=2222
+if [ -n "$SSH_TARGET" ]; then
+	BOARD_HOST=$SSH_TARGET
+	BOARD_PORT=
+fi
+
+# Check the deploy target is reachable before spending 15-20 minutes on a build
+# only to die at the first ssh/adb call.
+if [ "$SKIP_PREFLIGHT" != true ]; then
+	echo "=== Checking deploy target ==="
+	if [ "$VIA_SSH" = true ]; then
+		if ! ssh ${BOARD_PORT:+-p "$BOARD_PORT"} -o ConnectTimeout=10 \
+			"$BOARD_HOST" true; then
+			cat >&2 <<EOF
+
+error: cannot reach the board over SSH at ${BOARD_HOST}${BOARD_PORT:+ port ${BOARD_PORT}}.
+Nothing was built. Check:
+  - the board is powered and booted into Linux
+  - if this host/port is a forwarder (e.g. socat -> 'adb forward' on the Pi),
+    that 'adb devices' on the forwarding host lists the board, and that the
+    'adb forward' is still in place; re-add it if the board was re-plugged
+  - 'ssh ${BOARD_HOST} true' by hand for the raw error
+Re-run with --skip-preflight to build without deploying.
+EOF
+			exit 1
+		fi
+	elif [ "$VIA_PI" = true ]; then
+		if ! ssh -o ConnectTimeout=10 "$PI_HOST" true; then
+			echo "error: cannot reach the Pi at ${PI_HOST}. Nothing was built." >&2
+			exit 1
+		fi
+		if ! ssh "$PI_HOST" "adb devices" | grep -qw device; then
+			echo "error: no ADB device on ${PI_HOST}; check the board is powered and its USB cable is attached. Nothing was built." >&2
+			exit 1
+		fi
+	else
+		if ! adb devices | grep -qw device; then
+			echo "error: no ADB device on this host. Nothing was built." >&2
+			exit 1
+		fi
+	fi
+fi
 
 if [ ! -d "$KERNEL_DIR" ]; then
 	echo "=== Cloning kernel repo ==="
@@ -96,20 +161,38 @@ scripts/kconfig/merge_config.sh \
 	"$SCRIPT_DIR/bsp-additions.cfg" \
 	"$SCRIPT_DIR/imdt.cfg"
 
+# Emit the /__symbols__ node in the base DTB so device-tree overlays can be
+# applied against it (fdtoverlay fails with "base fdt does not have a
+# /__symbols__ node" otherwise). We use the kernel's per-target
+# DTC_FLAGS_<stem> hook (see scripts/Makefile.dtbs) rather than a global
+# DTC_FLAGS="-@": a command-line DTC_FLAGS would have command-line origin and
+# make GNU make ignore the Makefile's own "DTC_FLAGS += -Wno-*" appends,
+# dropping the kernel's warning-suppression config. The per-target variable is
+# appended, so it adds -@ while preserving everything else.
+DTC_SYMBOLS="DTC_FLAGS_qcs8550-imdt-sbc=-@"
+
 if [ "$DTB_ONLY" = true ]; then
 	# Fast path: build the device trees only, skipping the Image and modules.
 	echo "=== Building DTBs only ==="
-	make DTC_FLAGS="-@" -j$(nproc) dtbs
+	make "$DTC_SYMBOLS" -j$(nproc) dtbs
 else
 	# Build kernel, DTBs and modules
 	echo "=== Building kernel, DTBs and modules ==="
-	#make DTC_FLAGS="=@" clean
-	make DTC_FLAGS="-@" -j$(nproc) Image dtbs modules
+	#make clean
+	make "$DTC_SYMBOLS" -j$(nproc) Image dtbs modules
 
-	# Install modules to a temporary directory
+	# Install modules to a temporary directory.
+	#
+	# INSTALL_MOD_STRIP=1 runs 'strip --strip-debug' over each installed .ko.
+	# We build with CONFIG_DEBUG_INFO=y, which leaves full DWARF in every
+	# module: unstripped the tree is ~1.5 GiB, stripped it is well under
+	# 100 MiB. That debug info is dead weight on the board (use the vmlinux and
+	# the unstripped .ko files left in the build tree for host-side debugging),
+	# and dropping it makes the tar/scp/push step roughly an order of magnitude
+	# faster.
 	echo "=== Installing modules locally ==="
 	rm -rf "$INSTALL_MOD_PATH"
-	make INSTALL_MOD_PATH="$INSTALL_MOD_PATH" modules_install
+	make INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install
 fi
 
 # Stage all artifacts into a single, deploy-ready layout:
@@ -129,6 +212,14 @@ cp arch/arm64/boot/dts/qcom/qcs8550-imdt-*.dtb* "$STAGE_DIR/dtb/"
 if [ "$DTB_ONLY" != true ]; then
 	cp arch/arm64/boot/Image "$STAGE_DIR/"
 	cp -a "$INSTALL_MOD_PATH"/lib/modules/. "$STAGE_DIR/modules/"
+	# modules_install leaves a 'build' symlink in each module directory pointing
+	# back at the kernel source tree (older kernels also add 'source'). It is
+	# only useful for building out-of-tree modules on the host, and it is
+	# actively harmful here: 'adb push' dereferences symlinks, so it would walk
+	# the entire kernel tree and push it to the board. Drop it and ship modules
+	# only.
+	find "$STAGE_DIR/modules" -maxdepth 2 -type l \
+		\( -name build -o -name source \) -delete
 fi
 if [ -n "$DTB_OVERRIDE" ]; then
 	# Make sure the override DTB is present in the staging dir even if its name
@@ -147,7 +238,7 @@ set -e
 # the remote bash on stdin, and 'adb shell' would otherwise read from that same
 # stdin and swallow the rest of the script (silently skipping the steps below).
 adb wait-for-device </dev/null
-
+adb root
 if [ "${DTB_ONLY}" != true ]; then
   echo "=== Pushing kernel Image ==="
   adb push Image "${EFI_PART}/" </dev/null
@@ -180,16 +271,18 @@ if [ "$VIA_SSH" = true ]; then
 	# artifacts directly into place. The board has no rsync, so we use scp.
 	# Modules are shipped as a single tarball and unpacked on the board: there
 	# are thousands of small .ko files and scp pays a round-trip per file, so
-	# one tar stream is dramatically faster. We clear /lib/modules first so
-	# stale modules from previously installed kernels don't linger (mirrors the
-	# ADB path).
+	# one tar stream is dramatically faster. The staged tree holds stripped
+	# module binaries only (see INSTALL_MOD_STRIP above and the symlink pruning
+	# in the staging step), so this tarball is tens of MiB rather than well over
+	# a gigabyte. We clear /lib/modules first so stale modules from previously
+	# installed kernels don't linger (mirrors the ADB path).
 	#
 	# As with --via-pi, no compression: the kernel Image + .ko payload is
 	# largely incompressible, and we pin a hardware-accelerated cipher so SSH
 	# crypto isn't the bottleneck.
-	SSH="ssh -p ${BOARD_PORT}"
-	SCP="scp -P ${BOARD_PORT} -c aes128-gcm@openssh.com"
-	echo "=== Deploying directly to ${BOARD_HOST} over SSH (port ${BOARD_PORT}) ==="
+	SSH="ssh${BOARD_PORT:+ -p ${BOARD_PORT}}"
+	SCP="scp${BOARD_PORT:+ -P ${BOARD_PORT}} -c aes128-gcm@openssh.com"
+	echo "=== Deploying directly to ${BOARD_HOST} over SSH${BOARD_PORT:+ (port ${BOARD_PORT})} ==="
 	(
 		cd "$STAGE_DIR"
 		$SSH "$BOARD_HOST" "mkdir -p ${EFI_PART}/dtb/qcom/ /lib/modules"
