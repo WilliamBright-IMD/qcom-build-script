@@ -82,7 +82,7 @@ if [ "$VIA_PI" = true ] && [ "$VIA_SSH" = true ]; then
 	exit 1
 fi
 
-KERNEL_DIR=${1:-imdt-qcom-oss-linux-dev}
+KERNEL_DIR=${1:-imdt-qcom-oss-linux}
 DTB_OVERRIDE=${2:-}
 INSTALL_MOD_PATH="$KERNEL_DIR/modules_out"
 EFI_PART=/boot/
@@ -142,7 +142,7 @@ fi
 
 if [ ! -d "$KERNEL_DIR" ]; then
 	echo "=== Cloning kernel repo ==="
-	git clone git@github.com:imd-tec/imdt-qcom-oss-linux.git "$KERNEL_DIR"
+	git clone https://github.com/WilliamBright-IMD/kernel.git "$KERNEL_DIR"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
