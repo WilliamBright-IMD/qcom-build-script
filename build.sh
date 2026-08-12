@@ -142,7 +142,7 @@ fi
 
 if [ ! -d "$KERNEL_DIR" ]; then
 	echo "=== Cloning kernel repo ==="
-	git clone git@github.com:imd-tec/imdt-qcom-oss-linux-dev.git "$KERNEL_DIR"
+	git clone git@github.com:imd-tec/imdt-qcom-oss-linux.git "$KERNEL_DIR"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
